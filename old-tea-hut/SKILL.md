@@ -32,39 +32,61 @@ Match the user's drink request against `name` (e.g. `[GMT] Gula Melaka Milk Tea`
 python3 ~/.openclaw/workspace/skills/autopos/autopos.py spu <spuPid>
 ```
 Returns full detail for one item:
-- `skus[]` — each SKU has `skuPid`, `salePrice`, and `specs[]` (temperature options like Iced, Less Ice, Warm, Hot)
-- `featureGroups[]` — required customisations, pick one `attrPid` per group (e.g. Sweetness)
-- `extraGroups[]` — extra customisations; if `required=true`, you must pick `minQty` to `maxQty` attrs (e.g. Coffee/Tea Intensity is required with minQty=1)
+- `skus[]` — each SKU has `skuPid`, `price`, and `temp` (list of temperature names e.g. `["Iced"]`)
+- `featureGroups[]` — required customisations, pick one `attrPid` per group (e.g. Sweetness). Each attr has `attrPid`, `name`, `price`.
+- `extraGroups[]` — extra customisations; if `required=true` pick `min` to `max` attrs (e.g. Intensity is required with min=1)
 
 **How to resolve an item:**
-1. Pick `skuPid` by matching the user's temperature preference to `skus[].specs[].specName`
-   - Default to "Iced" if user doesn't specify
-2. Pick one `attrPid` from each `featureGroup` (e.g. for Sweetness: "Regular 100%", "Siew Dai", "Kosong", etc.)
-   - Default to "Regular 100%" if user doesn't specify
-3. Pick one `attrPid` from each required `extraGroup` (e.g. for Intensity: "Regular", "Light [P]", "Strong [K]", etc.)
-   - Default to "Regular" if user doesn't specify
-4. Price = `sku.salePrice` + sum of any non-zero attr prices selected
+1. Pick `skuPid` by matching user's temperature to `skus[].temp[0]` — default to `"Iced"`
+2. Pick one `attrPid` from each `featureGroup` — default to first attr (Regular/100%)
+3. Pick one `attrPid` from each required `extraGroup` — default to first attr (Regular)
+4. Price = `sku.price` + sum of any selected attr prices with non-zero price
 
 Call `spu` once per **unique** item (not per quantity).
 
-### Step 3 — Confirm (if confirm_required=true)
-Show the user a clear order summary before submitting:
+### Step 3 — Show summary and get user confirmation
+**You must do this before calling submit or confirm.** Show the order clearly:
 ```
 🧋 Order Summary:
   1× [GMT] Gula Melaka Milk Tea — Iced, Siew Dai, Regular — $2.10
   1× [KO] Coffee O — Hot, Kosong, Strong — $1.50
-  ──────────────────────────────
+  ──────────────────────
   Total: SGD 3.60
   Pickup: Old Tea Hut, Changi City Point #B1-K5
 
-Confirm? (yes/no)
+Confirm order? (yes / no)
 ```
-Wait for user confirmation. If they say no or want changes, re-resolve and show again.
+Wait for an explicit confirmation from the user ("yes", "ok", "confirm", "yep", etc.).
+If they say no or want changes, re-resolve and show the summary again.
 
-### Step 4 — Submit the order
+### Step 4 — Record confirmation (mandatory gate)
+Once the user confirms, call `confirm` passing the resolved items and total:
 ```bash
-python3 ~/.openclaw/workspace/skills/autopos/autopos.py submit '<items_json>' <total>
+python3 ~/.openclaw/workspace/skills/autopos/autopos.py confirm '<items_json>' <total>
 ```
+This saves the order to a gate file. **`submit` will be BLOCKED if this is not called first.**
+
+`items_json` is the same JSON array you resolved in Step 2:
+```json
+[
+  {
+    "spuPid": "12RwbXhjM5Z5ztnUQKBm3V",
+    "skuPid": "12RwbXhjM5ZppQz33wTRXu",
+    "qty": 1,
+    "featurePidList": ["12RvCAvh1B4YEyHvCLnWRu"],
+    "extraList": [
+      {"attrPid": "12RwXXv4EL5wskLiVzTxGF", "unitQty": 1}
+    ]
+  }
+]
+```
+
+### Step 5 — Submit the order
+```bash
+python3 ~/.openclaw/workspace/skills/autopos/autopos.py submit
+```
+**No arguments.** The script reads the order from the gate file written by `confirm`.
+This avoids any JSON shell-escaping issues entirely.
 
 `items_json` is a JSON array (must be single-quoted):
 ```json

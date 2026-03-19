@@ -9,7 +9,8 @@ and calls this script with structured inputs only.
 Commands:
   menu                          Compact menu JSON for LLM (pass 1)
   spu <spuPid>                  Full SKU + attr detail for one item (pass 2)
-  submit <items_json> <total>   Submit a fully resolved order
+  confirm <items_json> <total>  Save resolved order + record user confirmation
+  submit                        Submit the confirmed order (no args — reads from confirm)
   status [orderId]              Poll order confirmation
   refresh                       Force refresh menu cache
 """
@@ -37,9 +38,9 @@ BASE_URL = "https://autopos.cloud/api/public/ordering"
 
 RECEIVER_NAME  = "OpenClaw"   # ← update to your name
 RECEIVER_TEL   = "91112222"   # ← update to your number
-CONFIRM_ORDERS = True         # ← True = agent asks user to confirm before submit
 
-CACHE_FILE = Path(__file__).parent / "cache.json"
+CACHE_FILE    = Path(__file__).parent / "cache.json"
+CONFIRM_FILE  = Path(__file__).parent / "pending_confirm.json"  # gate file
 
 HEADERS = {
     "Accept": "application/json, text/plain, */*",
@@ -218,20 +219,19 @@ def cmd_menu(force_refresh=False):
     for cat in spu_cate_list:
         items = []
         for spu in cat.get("spuList", []):
+            if spu.get("selloutFlag"):
+                continue  # skip sold out items entirely
             items.append({
-                "spuPid":    spu["spuPid"],
-                "name":      spu["spuName"],
-                "name2":     spu.get("spuName2", ""),
-                "priceFrom": spu.get("priceMin", spu.get("price", 0)),
-                "soldOut":   spu.get("selloutFlag", False),
+                "spuPid": spu["spuPid"],
+                "name":   spu["spuName"],          # e.g. "[GMT] Gula Melaka Milk Tea"
+                "price":  spu.get("priceMin", spu.get("price", 0)),
             })
-        categories.append({"category": cat["spuCateName"], "items": items})
+        if items:
+            categories.append({"category": cat["spuCateName"], "items": items})
 
     out({
-        "token":            qr_data["token"],
-        "dataVer":          new_ver,
-        "confirm_required": CONFIRM_ORDERS,
-        "categories":       categories,
+        "token":      qr_data["token"],
+        "categories": categories,
     })
 
 
@@ -259,62 +259,48 @@ def cmd_spu(spu_pid):
 
     raw = api_spu(spu_pid, token)
 
-    # Build clean SKU list
+    # Compact SKU list — temp name as simple string, not nested object
     skus = []
     for sku in raw.get("skuList", []):
         spec_pids = set(sku.get("specPidSet", []))
-        specs = []
+        temp_names = []
         for sg in raw.get("specGroupList", []):
             for spec in sg.get("specList", []):
                 if spec["specPid"] in spec_pids:
-                    specs.append({
-                        "specPid":  spec["specPid"],
-                        "specName": spec["specName"],
-                    })
+                    temp_names.append(spec["specName"])
         skus.append({
-            "skuPid":    sku["skuPid"],
-            "salePrice": sku["salePrice"],
-            "specs":     specs,
+            "skuPid": sku["skuPid"],
+            "price":  sku["salePrice"],
+            "temp":   temp_names,  # e.g. ["Iced"] or ["Less Ice"]
         })
 
-    # Feature groups from first SKU (same across all SKUs for this SPU)
     first_sku = raw.get("skuList", [{}])[0] if raw.get("skuList") else {}
 
-    feature_groups = [
-        {
-            "groupName": fg["attrGroupName"],
-            "attrs": [
-                {
-                    "attrPid":  a["attrPid"],
-                    "attrName": a["attrName"],
-                    "price":    a.get("price", 0),
-                    "soldOut":  a.get("selloutFlag", False),
-                }
-                for a in fg.get("attrList", [])
-            ],
-        }
-        for fg in first_sku.get("featureGroupList", [])
-    ]
+    # Feature groups — drop sold-out attrs
+    feature_groups = []
+    for fg in first_sku.get("featureGroupList", []):
+        attrs = [
+            {"attrPid": a["attrPid"], "name": a["attrName"], "price": a.get("price", 0)}
+            for a in fg.get("attrList", []) if not a.get("selloutFlag")
+        ]
+        if attrs:
+            feature_groups.append({"group": fg["attrGroupName"], "attrs": attrs})
 
-    extra_groups = [
-        {
-            "groupName": eg["attrGroupName"],
-            "required":  eg.get("minQty", 0) > 0,
-            "mutexFlag": eg.get("mutexFlag", False),
-            "minQty":    eg.get("minQty", 0),
-            "maxQty":    eg.get("maxQty", 1),
-            "attrs": [
-                {
-                    "attrPid":  a["attrPid"],
-                    "attrName": a["attrName"],
-                    "price":    a.get("price", 0),
-                    "soldOut":  a.get("selloutFlag", False),
-                }
-                for a in eg.get("attrList", [])
-            ],
-        }
-        for eg in first_sku.get("extraGroupList", [])
-    ]
+    # Extra groups — drop sold-out attrs
+    extra_groups = []
+    for eg in first_sku.get("extraGroupList", []):
+        attrs = [
+            {"attrPid": a["attrPid"], "name": a["attrName"], "price": a.get("price", 0)}
+            for a in eg.get("attrList", []) if not a.get("selloutFlag")
+        ]
+        if attrs:
+            extra_groups.append({
+                "group":    eg["attrGroupName"],
+                "required": eg.get("minQty", 0) > 0,
+                "min":      eg.get("minQty", 0),
+                "max":      eg.get("maxQty", 1),
+                "attrs":    attrs,
+            })
 
     out({
         "spuPid":        raw["spuPid"],
@@ -325,25 +311,13 @@ def cmd_spu(spu_pid):
     })
 
 
-def cmd_submit(items_json, total):
+def cmd_confirm(items_json, total):
     """
-    Submit a fully resolved order. Called by the LLM after resolution
-    (and optionally after user confirmation if confirm_required=true).
+    Gate command — MUST be called after showing the order summary to the user
+    and receiving their explicit confirmation ("yes", "ok", "confirm", etc.).
 
-    items_json format:
-    [
-      {
-        "spuPid": "12RwbXhjM5Z5ztnUQKBm3V",
-        "skuPid": "12RwbXhjM5ZppQz33wTRXu",
-        "qty": 1,
-        "featurePidList": ["12RvCAvh1B3oRT6MYiWqwV"],
-        "extraList": [
-          {"attrPid": "12RwXXv4EL5wskLiVzTxGF", "unitQty": 1}
-        ]
-      }
-    ]
-
-    total = sum of (skuPid.salePrice + extra attr prices) * qty, rounded to 2dp
+    Saves the resolved order to pending_confirm.json.
+    After this, call: autopos.py submit  (no arguments needed)
     """
     try:
         items = json.loads(items_json)
@@ -351,8 +325,52 @@ def cmd_submit(items_json, total):
     except Exception as e:
         err(f"Invalid arguments: {e}")
 
+    gate = {
+        "confirmed":   True,
+        "items":       items,
+        "total":       total,
+        "confirmedAt": datetime.utcnow().isoformat(),
+    }
+    CONFIRM_FILE.write_text(json.dumps(gate, indent=2, ensure_ascii=False))
+
+    out({
+        "status":  "confirmed",
+        "message": "Order confirmed by user. Now call: autopos.py submit",
+        "total":   f"SGD {total:.2f}",
+    })
+
+
+def cmd_submit():
+    """
+    Submit the confirmed order. No arguments — reads from pending_confirm.json
+    written by the confirm command. This avoids any JSON shell-escaping issues.
+
+    Will error if confirm has not been called first.
+    """
+    # ── HARD GATE ─────────────────────────────────────────────────────────
+    if not CONFIRM_FILE.exists():
+        err(
+            "BLOCKED: confirmation required before submit. "
+            "Show order summary to user, get confirmation, "
+            "then call: autopos.py confirm '<items_json>' <total>"
+        )
+    try:
+        gate = json.loads(CONFIRM_FILE.read_text())
+    except Exception:
+        err("BLOCKED: pending_confirm.json is corrupted. Call confirm again.")
+
+    if not gate.get("confirmed"):
+        err("BLOCKED: confirmation gate not satisfied. Call confirm first.")
+
+    items = gate["items"]
+    total = round(float(gate["total"]), 2)
+
+    # Consume the gate — can't be reused
+    CONFIRM_FILE.unlink()
+    # ──────────────────────────────────────────────────────────────────────
+
     if not items:
-        err("items list is empty")
+        err("Confirmed items list is empty.")
 
     # Fresh token for submission
     qr_data = api_qr()
@@ -503,10 +521,12 @@ def main():
         if len(args) < 2:
             err("Usage: autopos.py spu <spuPid>")
         cmd_spu(args[1])
-    elif cmd == "submit":
+    elif cmd == "confirm":
         if len(args) < 3:
-            err("Usage: autopos.py submit '<items_json>' <total>")
-        cmd_submit(args[1], args[2])
+            err("Usage: autopos.py confirm '<items_json>' <total>")
+        cmd_confirm(args[1], args[2])
+    elif cmd == "submit":
+        cmd_submit()
     elif cmd == "status":
         cmd_status(args[1] if len(args) > 1 else None)
     elif cmd == "refresh":

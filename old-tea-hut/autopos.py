@@ -107,17 +107,21 @@ def api_spu(spu_pid, token):
 
 def api_submit(token, item_list, total):
     r = requests.post(f"{BASE_URL}/submit", headers=HEADERS, json={
-        "deliveryMode": "P",
         "checkoutMethod": "O",
         "memo": "",
-        "orderingAmount": total,
-        "itemList": item_list,
+        "orderingCart": {
+            "deliveryMode": "P",
+            "orderingAmount": total,
+            "itemList": item_list,
+            "activPromoList": []
+        },
         "receiverTel": RECEIVER_TEL,
         "receiverName": RECEIVER_NAME,
         "expectTime": None,
         "dueAmount": total,
         "token": token
     }, timeout=15)
+
     r.raise_for_status()
     d = r.json()
     if d.get("code") != 200:
@@ -380,9 +384,11 @@ def cmd_submit():
 
     # Expand qty — API expects unitQty=1 per line
     api_items = []
+    idx = 0
     for item in items:
         for _ in range(item.get("qty", 1)):
             api_items.append({
+                "index":          idx,
                 "spuType":        "G",
                 "spuPid":         item["spuPid"],
                 "skuPid":         item["skuPid"],
@@ -390,6 +396,7 @@ def cmd_submit():
                 "featurePidList": item.get("featurePidList", []),
                 "extraList":      item.get("extraList", []),
             })
+            idx += 1
 
     order_data = api_submit(token, api_items, total)
     order_id   = (
